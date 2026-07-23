@@ -5,7 +5,16 @@ const db = require('../db')
 const { auth } = require('../middleware/auth')
 
 async function doLogin(email, password) {
-  // ลำดับ: curriculum_manager → teacher → student
+  // ลำดับ: academic_affairs → curriculum_manager → teacher → student
+  const acad = await db.query(
+    "SELECT email,name FROM academic_affairs_profiles WHERE email=$1", [email]
+  )
+  if (acad.rows.length) {
+    const au = await db.query(
+      "SELECT password_hash FROM auth_users WHERE user_ref=$1 AND role='academic_affairs'", [email]
+    )
+    if (au.rows.length) return { user_ref: email, role: 'academic_affairs', display_name: acad.rows[0].name, hash: au.rows[0].password_hash }
+  }
   const mgr = await db.query(
     "SELECT email,name FROM manager_profiles WHERE email=$1", [email]
   )
@@ -70,7 +79,7 @@ router.post('/register/manager', async (req, res) => {
       [email, name, department || null])
     await db.query('INSERT INTO auth_users (user_ref,role,password_hash) VALUES ($1,$2,$3)',
       [email, 'curriculum_manager', await bcrypt.hash(password, 10)])
-    res.status(201).json({ message: 'ลงทะเบียนผู้บริหารหลักสูตรสำเร็จ' })
+    res.status(201).json({ message: 'ลงทะเบียนผู้รับผิดชอบหลักสูตรสำเร็จ' })
   } catch (err) { res.status(500).json({ error: 'Server error' }) }
 })
 
@@ -96,14 +105,19 @@ router.get('/me', auth, async (req, res) => {
     if (role === 'student') {
       const r = await db.query(
         `SELECT s.*,ca.cud_name AS curriculum_name FROM student s
-         JOIN curriculum_approve ca ON ca.cur_id=s.cur_id AND ca.cur_improve=s.cur_improve
+         LEFT JOIN curriculum_approve ca ON ca.cur_id=s.cur_id AND ca.cur_improve=s.cur_improve
          WHERE s.stid=$1`, [user_ref]
       )
+      if (!r.rows.length) return res.status(404).json({ error: 'Student not found' })
       return res.json({ ...r.rows[0], role })
     }
     if (role === 'teacher') {
       const r = await db.query('SELECT * FROM teacher WHERE teacher_id=$1', [user_ref])
       return res.json({ ...r.rows[0], role })
+    }
+    if (role === 'academic_affairs') {
+      const r = await db.query('SELECT * FROM academic_affairs_profiles WHERE email=$1', [user_ref])
+      return res.json({ ...r.rows[0], role, email: user_ref })
     }
     const r = await db.query('SELECT * FROM manager_profiles WHERE email=$1', [user_ref])
     return res.json({ ...r.rows[0], role, email: user_ref })

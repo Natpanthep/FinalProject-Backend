@@ -73,14 +73,21 @@ router.get('/student/:stid', auth, async (req, res) => {
       [stid, student.cur_id, student.cur_improve]
     )
 
-    res.json({ student, plo, clo: cloByVicha.rows })
+    const regRows = await db.query(
+      `SELECT r.course_id, c.course_name, c.credits, r.grade, r.grade_point, r.semester, r.academic_year
+       FROM register r JOIN course c ON c.course_id=r.course_id
+       WHERE r.stid=$1 ORDER BY r.academic_year, r.semester`,
+      [stid]
+    )
+
+    res.json({ student, plo, clo: cloByVicha.rows, register: regRows.rows })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Server error' })
   }
 })
 
-// GET /api/plo/overview (teacher)
+// GET /api/plo/overview (all users except student)
 router.get('/overview', auth, async (req, res) => {
   if (req.user.role === 'student') return res.status(403).json({ error: 'Teacher only' })
   try {
@@ -88,10 +95,32 @@ router.get('/overview', auth, async (req, res) => {
       `SELECT s.stid, s.st_name, s.email, s.intake_year, ca.cud_name,
               COUNT(DISTINCT r.course_id) AS courses_registered
        FROM student s
-       JOIN curriculum_approve ca ON ca.cur_id=s.cur_id AND ca.cur_improve=s.cur_improve
+       LEFT JOIN curriculum_approve ca ON ca.cur_id=s.cur_id AND ca.cur_improve=s.cur_improve
        LEFT JOIN register r ON r.stid=s.stid
        GROUP BY s.stid, s.st_name, s.email, s.intake_year, ca.cud_name
        ORDER BY s.stid`
+    )
+    res.json(r.rows)
+  } catch (err) { res.status(500).json({ error: 'Server error' }) }
+})
+
+// GET /api/plo/teacher/students — นักศึกษาที่เรียนวิชาของอาจารย์คนนี้
+router.get('/teacher/students', auth, async (req, res) => {
+  if (req.user.role !== 'teacher') return res.status(403).json({ error: 'Teacher only' })
+  try {
+    const r = await db.query(
+      `SELECT DISTINCT s.stid, s.st_name, s.email, s.intake_year, ca.cud_name,
+              COUNT(DISTINCT r2.course_id) AS courses_registered
+       FROM student s
+       JOIN register r ON r.stid=s.stid
+       JOIN course c ON c.course_id=r.course_id
+       LEFT JOIN curriculum_approve ca ON ca.cur_id=s.cur_id AND ca.cur_improve=s.cur_improve
+       LEFT JOIN register r2 ON r2.stid=s.stid
+       WHERE c.teacher_id=$1
+         OR c.course_id IN (SELECT course_id FROM course_teacher WHERE teacher_id=$1)
+       GROUP BY s.stid, s.st_name, s.email, s.intake_year, ca.cud_name
+       ORDER BY s.stid`,
+      [req.user.user_ref]
     )
     res.json(r.rows)
   } catch (err) { res.status(500).json({ error: 'Server error' }) }

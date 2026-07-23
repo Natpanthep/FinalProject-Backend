@@ -36,6 +36,13 @@ router.post('/components', auth, teacherOnly, async (req, res) => {
   const { course_id, semester, title, max_score, clo_ids } = req.body
   if (!course_id || !semester || !title || !max_score)
     return res.status(400).json({ error: 'course_id, semester, title, max_score จำเป็น' })
+  // ตรวจสอบว่าคะแนนรวมไม่เกิน 100
+  const sumRow = await db.query(
+    'SELECT COALESCE(SUM(max_score),0) AS total FROM score_components WHERE course_id=$1 AND semester=$2 AND is_active=TRUE',
+    [course_id, semester]
+  )
+  if (Number(sumRow.rows[0].total) + Number(max_score) > 100)
+    return res.status(400).json({ error: `คะแนนรวมจะเป็น ${Number(sumRow.rows[0].total) + Number(max_score)} เกิน 100 ไม่สามารถบันทึกได้` })
   const client = await db.getClient()
   try {
     await client.query('BEGIN')
@@ -76,6 +83,20 @@ router.post('/components', auth, teacherOnly, async (req, res) => {
 // PUT /api/assessment/components/:id
 router.put('/components/:id', auth, teacherOnly, async (req, res) => {
   const { title, max_score, clo_ids } = req.body
+  // ตรวจสอบว่าคะแนนรวม (ไม่รวม component ที่กำลังแก้ไข) + max_score ใหม่ ไม่เกิน 100
+  const cur = await db.query(
+    'SELECT course_id, semester, max_score AS old_max FROM score_components WHERE component_id=$1',
+    [req.params.id]
+  )
+  if (cur.rows.length) {
+    const { course_id, semester, old_max } = cur.rows[0]
+    const sumRow = await db.query(
+      'SELECT COALESCE(SUM(max_score),0) AS total FROM score_components WHERE course_id=$1 AND semester=$2 AND is_active=TRUE AND component_id!=$3',
+      [course_id, semester, req.params.id]
+    )
+    if (Number(sumRow.rows[0].total) + Number(max_score) > 100)
+      return res.status(400).json({ error: `คะแนนรวมจะเป็น ${Number(sumRow.rows[0].total) + Number(max_score)} เกิน 100 ไม่สามารถบันทึกได้` })
+  }
   const client = await db.getClient()
   try {
     await client.query('BEGIN')

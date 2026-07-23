@@ -17,9 +17,15 @@ const teacherOnly = (req, res, next) => {
 }
 
 const managerOnly = (req, res, next) => {
-  if (req.user.role !== 'curriculum_manager')
-    return res.status(403).json({ error: 'Curriculum manager access required' })
+  if (!['curriculum_manager','academic_affairs'].includes(req.user.role))
+    return res.status(403).json({ error: 'Manager access required' })
   next()
 }
 
-module.exports = { auth, teacherOnly, managerOnly }
+const academicAffairsOnly = (req, res, next) => {
+  if (req.user.role !== 'academic_affairs')
+    return res.status(403).json({ error: 'Academic affairs access required' })
+  next()
+}
+
+module.exports = { auth, teacherOnly, managerOnly, academicAffairsOnly }
