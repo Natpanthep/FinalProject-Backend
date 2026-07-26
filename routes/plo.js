@@ -104,20 +104,22 @@ router.get('/overview', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Server error' }) }
 })
 
-// GET /api/plo/teacher/students — นักศึกษาที่เรียนวิชาของอาจารย์คนนี้
+// GET /api/plo/teacher/students — นักศึกษาในหลักสูตรที่อาจารย์สอน
 router.get('/teacher/students', auth, async (req, res) => {
   if (req.user.role !== 'teacher') return res.status(403).json({ error: 'Teacher only' })
   try {
     const r = await db.query(
-      `SELECT DISTINCT s.stid, s.st_name, s.email, s.intake_year, ca.cud_name,
-              COUNT(DISTINCT r2.course_id) AS courses_registered
+      `SELECT s.stid, s.st_name, s.email, s.intake_year, ca.cud_name,
+              COUNT(DISTINCT r.course_id) AS courses_registered
        FROM student s
-       JOIN register r ON r.stid=s.stid
-       JOIN course c ON c.course_id=r.course_id
        LEFT JOIN curriculum_approve ca ON ca.cur_id=s.cur_id AND ca.cur_improve=s.cur_improve
-       LEFT JOIN register r2 ON r2.stid=s.stid
-       WHERE c.teacher_id=$1
-         OR c.course_id IN (SELECT course_id FROM course_teacher WHERE teacher_id=$1)
+       LEFT JOIN register r ON r.stid=s.stid
+       WHERE (s.cur_id, s.cur_improve) IN (
+         SELECT DISTINCT c.cur_id, c.cur_improve
+         FROM course c
+         WHERE c.teacher_id=$1
+            OR c.course_id IN (SELECT course_id FROM course_teacher WHERE teacher_id=$1)
+       )
        GROUP BY s.stid, s.st_name, s.email, s.intake_year, ca.cud_name
        ORDER BY s.stid`,
       [req.user.user_ref]

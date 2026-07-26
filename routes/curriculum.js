@@ -32,17 +32,25 @@ router.get('/students/lookup', async (req, res) => {
 
 // ── Teacher ───────────────────────────────────────────────────
 router.get('/teacher/courses', auth, async (req, res) => {
-  const { semester } = req.query
+  const { semester, year_level } = req.query
   if (!semester) return res.status(400).json({ error: 'semester required' })
+  const yl = year_level ? parseInt(year_level) : null
   try {
     const r = await db.query(
       `SELECT DISTINCT c.course_id,c.course_name,c.credits,c.year_level,c.semester_no,c.cur_id,c.cur_improve,ca.cud_name
        FROM course c
        JOIN curriculum_approve ca ON ca.cur_id=c.cur_id AND ca.cur_improve=c.cur_improve
-       WHERE c.teacher_id=$1
-         OR c.course_id IN (SELECT course_id FROM course_teacher WHERE teacher_id=$1 AND semester=$2)
+       WHERE (
+         c.course_id IN (SELECT course_id FROM course_teacher WHERE teacher_id=$1 AND semester=$2)
+         OR (
+           c.teacher_id=$1
+           AND NOT EXISTS (SELECT 1 FROM course_teacher ct WHERE ct.course_id=c.course_id AND ct.teacher_id=$1)
+           AND (COALESCE(c.semester_no::text,'1') || '/' || ca.cur_year::text) = $2
+         )
+       )
+       AND ($3::int IS NULL OR c.year_level = $3)
        ORDER BY c.course_id`,
-      [req.user.user_ref, semester]
+      [req.user.user_ref, semester, yl]
     )
     res.json(r.rows)
   } catch { res.status(500).json({ error: 'Server error' }) }
@@ -51,15 +59,35 @@ router.get('/teacher/courses', auth, async (req, res) => {
 router.get('/teacher/semesters', auth, async (req, res) => {
   try {
     const r = await db.query(
-      `SELECT ct.semester,
-              CAST(split_part(ct.semester,'/',1) AS int) AS semester_no,
-              CAST(split_part(ct.semester,'/',2) AS int) AS academic_year,
-              MIN(c.year_level) AS year_level
-       FROM course_teacher ct
-       JOIN course c ON c.course_id=ct.course_id
-       WHERE ct.teacher_id=$1
-       GROUP BY ct.semester
-       ORDER BY ct.semester DESC`,
+      `SELECT semester, semester_no, academic_year, year_level
+       FROM (
+         -- Explicit: one row per (semester, year_level)
+         SELECT ct.semester,
+                CAST(split_part(ct.semester,'/',1) AS int) AS semester_no,
+                CAST(split_part(ct.semester,'/',2) AS int) AS academic_year,
+                c.year_level
+         FROM course_teacher ct
+         JOIN course c ON c.course_id=ct.course_id
+         WHERE ct.teacher_id=$1
+         GROUP BY ct.semester, c.year_level
+
+         UNION
+
+         -- Synthetic: one row per (semester_no, cur_year, year_level)
+         SELECT COALESCE(c.semester_no::text,'1') || '/' || ca.cur_year::text AS semester,
+                COALESCE(c.semester_no, 1) AS semester_no,
+                ca.cur_year AS academic_year,
+                c.year_level
+         FROM course c
+         JOIN curriculum_approve ca ON ca.cur_id=c.cur_id AND ca.cur_improve=c.cur_improve
+         WHERE c.teacher_id=$1
+           AND c.semester_no IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM course_teacher ct WHERE ct.course_id=c.course_id AND ct.teacher_id=$1
+           )
+         GROUP BY c.semester_no, ca.cur_year, c.year_level
+       ) combined
+       ORDER BY semester DESC, year_level`,
       [req.user.user_ref]
     )
     res.json(r.rows)
@@ -179,6 +207,35 @@ router.post('/manage/parse-pdf', auth, managerOnly, upload.single('pdf'), async 
     if (!jsonMatch) return res.status(422).json({ error: 'ไม่สามารถอ่านข้อมูลจาก PDF ได้', raw: text.slice(0,500) })
     res.json({ success: true, data: JSON.parse(jsonMatch[0]) })
   } catch (err) { res.status(500).json({ error: 'เกิดข้อผิดพลาดในการอ่าน PDF: ' + err.message }) }
+})
+
+// ── Auto-register student in curriculum courses (manager or teacher) ──
+router.post('/students/:stid/auto-register', auth, async (req, res) => {
+  if (!['curriculum_manager','teacher','academic_affairs'].includes(req.user.role))
+    return res.status(403).json({ error: 'Permission denied' })
+  const { stid } = req.params
+  try {
+    const sResult = await db.query('SELECT cur_id, cur_improve, intake_year FROM student WHERE stid=$1', [stid])
+    if (!sResult.rows.length) return res.status(404).json({ error: 'ไม่พบนักศึกษา' })
+    const { cur_id, cur_improve, intake_year } = sResult.rows[0]
+    const courses = await db.query(
+      'SELECT course_id, year_level, semester_no FROM course WHERE cur_id=$1 AND cur_improve=$2',
+      [cur_id, cur_improve]
+    )
+    let registered = 0
+    for (const c of courses.rows) {
+      const yr = intake_year && c.year_level ? Number(intake_year) + Number(c.year_level) - 1 : null
+      const sem = c.semester_no && yr ? `${c.semester_no}/${yr}` : null
+      try {
+        await db.query(
+          `INSERT INTO register (stid,course_id,semester,academic_year) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+          [stid, c.course_id, sem, yr]
+        )
+        registered++
+      } catch {}
+    }
+    res.json({ message: `ลงทะเบียน ${registered} วิชาให้ ${stid} สำเร็จ`, registered })
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 // ── Manager: Auto-register student in curriculum courses ──────
@@ -541,6 +598,43 @@ router.get('/courses/:course_id/clo', auth, async (req, res) => {
     )
     res.json(r.rows)
   } catch { res.status(500).json({ error: 'Server error' }) }
+})
+
+// GET PLO ที่ใช้ได้กับ course นี้ (จาก curriculum ของ course)
+router.get('/courses/:course_id/available-plos', auth, async (req, res) => {
+  try {
+    const r = await db.query(
+      `SELECT p.pid, p.plo_id, p.plo_detail, p.target_pct
+       FROM course c
+       JOIN plo p ON p.cur_id=c.cur_id AND p.cur_improve=c.cur_improve
+       WHERE c.course_id=$1 ORDER BY p.plo_id`,
+      [req.params.course_id]
+    )
+    res.json(r.rows)
+  } catch { res.status(500).json({ error: 'Server error' }) }
+})
+
+// PUT — set PLO mapping ของ CLO (replace all)
+router.put('/courses/clo/:cc_id/plo', auth, async (req, res) => {
+  const { pids } = req.body
+  const client = await db.getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query('DELETE FROM clo_plo_mapping WHERE cc_id=$1', [req.params.cc_id])
+    if (Array.isArray(pids)) {
+      for (const pid of pids) {
+        await client.query(
+          'INSERT INTO clo_plo_mapping (cc_id,pid,is_active) VALUES ($1,$2,true) ON CONFLICT DO NOTHING',
+          [req.params.cc_id, pid]
+        )
+      }
+    }
+    await client.query('COMMIT')
+    res.json({ message: 'บันทึก PLO mapping สำเร็จ' })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    res.status(500).json({ error: err.message })
+  } finally { client.release() }
 })
 
 // CLO CRUD for teachers

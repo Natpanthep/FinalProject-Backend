@@ -17,7 +17,8 @@ router.get('/components/:course_id', auth, async (req, res) => {
     const r = await db.query(
       `SELECT sc.*,
               json_agg(json_build_object(
-                'cc_id', cc.cc_id, 'clo_id', cc.clo_id, 'clo_detail', cc.clo_detail
+                'cc_id', cc.cc_id, 'clo_id', cc.clo_id, 'clo_detail', cc.clo_detail,
+                'max_score', ccm.max_score
               ) ORDER BY cc.clo_id) FILTER (WHERE cc.cc_id IS NOT NULL) AS clos
        FROM score_components sc
        LEFT JOIN component_clo_map ccm ON ccm.component_id=sc.component_id
@@ -31,12 +32,12 @@ router.get('/components/:course_id', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// POST /api/assessment/components  — สร้าง component + ผูก CLO
+// POST /api/assessment/components  — สร้าง component + ผูก CLO (พร้อม max_score ต่อ CLO)
+// body: { course_id, semester, title, max_score, clo_ids: [{cc_id, max_score}] | [cc_id] }
 router.post('/components', auth, teacherOnly, async (req, res) => {
   const { course_id, semester, title, max_score, clo_ids } = req.body
   if (!course_id || !semester || !title || !max_score)
     return res.status(400).json({ error: 'course_id, semester, title, max_score จำเป็น' })
-  // ตรวจสอบว่าคะแนนรวมไม่เกิน 100
   const sumRow = await db.query(
     'SELECT COALESCE(SUM(max_score),0) AS total FROM score_components WHERE course_id=$1 AND semester=$2 AND is_active=TRUE',
     [course_id, semester]
@@ -52,20 +53,20 @@ router.post('/components', auth, teacherOnly, async (req, res) => {
       [course_id, semester, title, max_score, req.user.user_ref]
     )
     const comp = r.rows[0]
-    // ผูก CLO
     if (Array.isArray(clo_ids) && clo_ids.length) {
-      for (const cc_id of clo_ids) {
+      for (const item of clo_ids) {
+        const cc_id   = typeof item === 'object' ? item.cc_id    : item
+        const clo_max = typeof item === 'object' ? item.max_score : null
         await client.query(
-          'INSERT INTO component_clo_map (component_id, cc_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
-          [comp.component_id, cc_id]
+          'INSERT INTO component_clo_map (component_id, cc_id, max_score) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+          [comp.component_id, cc_id, clo_max || null]
         )
       }
     }
     await client.query('COMMIT')
-    // return พร้อม CLO
     const full = await db.query(
       `SELECT sc.*,
-              json_agg(json_build_object('cc_id',cc.cc_id,'clo_id',cc.clo_id,'clo_detail',cc.clo_detail)
+              json_agg(json_build_object('cc_id',cc.cc_id,'clo_id',cc.clo_id,'clo_detail',cc.clo_detail,'max_score',ccm.max_score)
               ORDER BY cc.clo_id) FILTER (WHERE cc.cc_id IS NOT NULL) AS clos
        FROM score_components sc
        LEFT JOIN component_clo_map ccm ON ccm.component_id=sc.component_id
@@ -108,10 +109,12 @@ router.put('/components/:id', auth, teacherOnly, async (req, res) => {
     // อัปเดต CLO mapping
     if (Array.isArray(clo_ids)) {
       await client.query('DELETE FROM component_clo_map WHERE component_id=$1', [req.params.id])
-      for (const cc_id of clo_ids) {
+      for (const item of clo_ids) {
+        const cc_id   = typeof item === 'object' ? item.cc_id    : item
+        const clo_max = typeof item === 'object' ? item.max_score : null
         await client.query(
-          'INSERT INTO component_clo_map (component_id, cc_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
-          [req.params.id, cc_id]
+          'INSERT INTO component_clo_map (component_id, cc_id, max_score) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+          [req.params.id, cc_id, clo_max || null]
         )
       }
     }
@@ -142,8 +145,10 @@ router.get('/scores/:course_id', auth, teacherOnly, async (req, res) => {
     // ดึง components ของวิชา+เทอม
     const comps = await db.query(
       `SELECT sc.component_id, sc.title, sc.max_score,
-              json_agg(json_build_object('cc_id',cc.cc_id,'clo_id',cc.clo_id)
-              ORDER BY cc.clo_id) FILTER (WHERE cc.cc_id IS NOT NULL) AS clos
+              json_agg(json_build_object(
+                'cc_id', cc.cc_id, 'clo_id', cc.clo_id, 'clo_detail', cc.clo_detail,
+                'max_score', ccm.max_score
+              ) ORDER BY cc.clo_id) FILTER (WHERE cc.cc_id IS NOT NULL) AS clos
        FROM score_components sc
        LEFT JOIN component_clo_map ccm ON ccm.component_id=sc.component_id
        LEFT JOIN course_clo cc ON cc.cc_id=ccm.cc_id
@@ -151,14 +156,14 @@ router.get('/scores/:course_id', auth, teacherOnly, async (req, res) => {
        GROUP BY sc.component_id ORDER BY sc.component_id`,
       [req.params.course_id, semester]
     )
-    // ดึง student ในวิชา
+    // ดึง student ในวิชา (ไม่ filter semester เพื่อรองรับ register semester ที่ต่างกัน)
     const students = await db.query(
       `SELECT s.stid, s.st_name FROM student s
        JOIN register r ON r.stid=s.stid
-       WHERE r.course_id=$1 AND r.semester=$2 ORDER BY s.stid`,
-      [req.params.course_id, semester]
+       WHERE r.course_id=$1 ORDER BY s.stid`,
+      [req.params.course_id]
     )
-    // ดึงคะแนนที่มีอยู่
+    // ดึงคะแนน component-level
     const existingScores = await db.query(
       `SELECT scs.stid, scs.component_id, scs.score_given
        FROM student_component_scores scs
@@ -166,16 +171,31 @@ router.get('/scores/:course_id', auth, teacherOnly, async (req, res) => {
        WHERE sc.course_id=$1 AND sc.semester=$2`,
       [req.params.course_id, semester]
     )
-    // สร้าง lookup: { stid: { component_id: score_given } }
     const scoreLookup = {}
     for (const row of existingScores.rows) {
       if (!scoreLookup[row.stid]) scoreLookup[row.stid] = {}
       scoreLookup[row.stid][row.component_id] = row.score_given
     }
+    // ดึงคะแนน CLO-level (per component per CLO)
+    const cloScores = await db.query(
+      `SELECT sccs.stid, sccs.component_id, sccs.cc_id, sccs.score_given
+       FROM student_component_clo_scores sccs
+       JOIN score_components sc ON sc.component_id=sccs.component_id
+       WHERE sc.course_id=$1 AND sc.semester=$2`,
+      [req.params.course_id, semester]
+    )
+    // cloScoreLookup: { stid: { component_id: { cc_id: score_given } } }
+    const cloScoreLookup = {}
+    for (const row of cloScores.rows) {
+      if (!cloScoreLookup[row.stid]) cloScoreLookup[row.stid] = {}
+      if (!cloScoreLookup[row.stid][row.component_id]) cloScoreLookup[row.stid][row.component_id] = {}
+      cloScoreLookup[row.stid][row.component_id][row.cc_id] = row.score_given
+    }
     res.json({
       components: comps.rows,
       students: students.rows,
-      scores: scoreLookup
+      scores: scoreLookup,
+      cloScores: cloScoreLookup
     })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -206,6 +226,40 @@ router.post('/scores/bulk', auth, teacherOnly, async (req, res) => {
     }
     await client.query('COMMIT')
     res.json({ message: `บันทึก ${saved} คะแนน` })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    res.status(500).json({ error: err.message })
+  } finally { client.release() }
+})
+
+// POST /api/assessment/clo-scores/bulk — บันทึกคะแนนระดับ CLO
+// body: { scores: [{stid, component_id, cc_id, score_given}] }
+router.post('/clo-scores/bulk', auth, teacherOnly, async (req, res) => {
+  const { scores } = req.body
+  if (!Array.isArray(scores)) return res.status(400).json({ error: 'scores array required' })
+  const client = await db.getClient()
+  try {
+    await client.query('BEGIN')
+    let saved = 0
+    for (const { stid, component_id, cc_id, score_given } of scores) {
+      if (!stid || !component_id || !cc_id || score_given === '' || score_given === undefined) continue
+      // validate ไม่เกิน max_score ของ CLO นั้น
+      const mx = await client.query(
+        'SELECT max_score FROM component_clo_map WHERE component_id=$1 AND cc_id=$2', [component_id, cc_id]
+      )
+      const maxVal = mx.rows[0]?.max_score
+      if (maxVal !== null && maxVal !== undefined && Number(score_given) > Number(maxVal)) continue
+      await client.query(
+        `INSERT INTO student_component_clo_scores (stid, component_id, cc_id, score_given, graded_by)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (stid, component_id, cc_id) DO UPDATE
+           SET score_given=$4, graded_by=$5, graded_at=NOW()`,
+        [stid, component_id, cc_id, Number(score_given), req.user.user_ref]
+      )
+      saved++
+    }
+    await client.query('COMMIT')
+    res.json({ message: `บันทึก ${saved} CLO scores` })
   } catch (err) {
     await client.query('ROLLBACK')
     res.status(500).json({ error: err.message })
